@@ -167,7 +167,7 @@ gemini
 
 For Google Workspace accounts and other authentication methods, see the [authentication guide](./docs/cli/authentication.md).
 
-## 🚀 Getting Started
+## Getting Started
 
 ### Basic Usage
 
