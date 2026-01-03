@@ -6,7 +6,7 @@
 
 import { type Config } from '../config/config.js';
 import { type Status } from '../core/coreToolScheduler.js';
-import { type ThoughtSummary } from '../core/turn.js';
+import { type ThoughtSummary } from '../utils/thoughtUtils.js';
 import { getProjectHash } from '../utils/paths.js';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -15,6 +15,9 @@ import type {
   PartListUnion,
   GenerateContentResponseUsageMetadata,
 } from '@google/genai';
+import { debugLogger } from '../utils/debugLogger.js';
+
+export const SESSION_FILE_PREFIX = 'session-';
 
 /**
  * Token usage summary for a message or conversation.
@@ -59,7 +62,7 @@ export interface ToolCallRecord {
  */
 export type ConversationRecordExtra =
   | {
-      type: 'user';
+      type: 'user' | 'info' | 'error' | 'warning';
     }
   | {
       type: 'gemini';
@@ -83,6 +86,7 @@ export interface ConversationRecord {
   startTime: string;
   lastUpdated: string;
   messages: MessageRecord[];
+  summary?: string;
 }
 
 /**
@@ -149,7 +153,7 @@ export class ChatRecordingService {
           .toISOString()
           .slice(0, 16)
           .replace(/:/g, '-');
-        const filename = `session-${timestamp}-${this.sessionId.slice(
+        const filename = `${SESSION_FILE_PREFIX}${timestamp}-${this.sessionId.slice(
           0,
           8,
         )}.json`;
@@ -168,7 +172,7 @@ export class ChatRecordingService {
       this.queuedThoughts = [];
       this.queuedTokens = null;
     } catch (error) {
-      console.error('Error initializing chat recording service:', error);
+      debugLogger.error('Error initializing chat recording service:', error);
       throw error;
     }
   }
@@ -195,6 +199,7 @@ export class ChatRecordingService {
    * Records a message in the conversation.
    */
   recordMessage(message: {
+    model: string | undefined;
     type: ConversationRecordExtra['type'];
     content: PartListUnion;
   }): void {
@@ -209,7 +214,7 @@ export class ChatRecordingService {
             ...msg,
             thoughts: this.queuedThoughts,
             tokens: this.queuedTokens,
-            model: this.config.getModel(),
+            model: message.model,
           });
           this.queuedThoughts = [];
           this.queuedTokens = null;
@@ -219,7 +224,7 @@ export class ChatRecordingService {
         }
       });
     } catch (error) {
-      console.error('Error saving message:', error);
+      debugLogger.error('Error saving message to chat history.', error);
       throw error;
     }
   }
@@ -236,7 +241,7 @@ export class ChatRecordingService {
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
-      console.error('Error saving thought:', error);
+      debugLogger.error('Error saving thought to chat history.', error);
       throw error;
     }
   }
@@ -270,7 +275,10 @@ export class ChatRecordingService {
         }
       });
     } catch (error) {
-      console.error('Error updating message tokens:', error);
+      debugLogger.error(
+        'Error updating message tokens in chat history.',
+        error,
+      );
       throw error;
     }
   }
@@ -279,7 +287,7 @@ export class ChatRecordingService {
    * Adds tool calls to the last message in the conversation (which should be by Gemini).
    * This method enriches tool calls with metadata from the ToolRegistry.
    */
-  recordToolCalls(toolCalls: ToolCallRecord[]): void {
+  recordToolCalls(model: string, toolCalls: ToolCallRecord[]): void {
     if (!this.conversationFile) return;
 
     // Enrich tool calls with metadata from the ToolRegistry
@@ -318,7 +326,7 @@ export class ChatRecordingService {
             type: 'gemini' as const,
             toolCalls: enrichedToolCalls,
             thoughts: this.queuedThoughts,
-            model: this.config.getModel(),
+            model,
           };
           // If there are any queued thoughts join them to this message.
           if (this.queuedThoughts.length > 0) {
@@ -364,7 +372,10 @@ export class ChatRecordingService {
         }
       });
     } catch (error) {
-      console.error('Error adding tool call to message:', error);
+      debugLogger.error(
+        'Error adding tool call to message in chat history.',
+        error,
+      );
       throw error;
     }
   }
@@ -378,7 +389,7 @@ export class ChatRecordingService {
       return JSON.parse(this.cachedLastConvData);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-        console.error('Error reading conversation file:', error);
+        debugLogger.error('Error reading conversation file.', error);
         throw error;
       }
 
@@ -410,7 +421,7 @@ export class ChatRecordingService {
         fs.writeFileSync(this.conversationFile, newContent);
       }
     } catch (error) {
-      console.error('Error writing conversation file:', error);
+      debugLogger.error('Error writing conversation file.', error);
       throw error;
     }
   }
@@ -428,6 +439,44 @@ export class ChatRecordingService {
   }
 
   /**
+   * Saves a summary for the current session.
+   */
+  saveSummary(summary: string): void {
+    if (!this.conversationFile) return;
+
+    try {
+      this.updateConversation((conversation) => {
+        conversation.summary = summary;
+      });
+    } catch (error) {
+      debugLogger.error('Error saving summary to chat history.', error);
+      // Don't throw - we want graceful degradation
+    }
+  }
+
+  /**
+   * Gets the current conversation data (for summary generation).
+   */
+  getConversation(): ConversationRecord | null {
+    if (!this.conversationFile) return null;
+
+    try {
+      return this.readConversation();
+    } catch (error) {
+      debugLogger.error('Error reading conversation for summary.', error);
+      return null;
+    }
+  }
+
+  /**
+   * Gets the path to the current conversation file.
+   * Returns null if the service hasn't been initialized yet.
+   */
+  getConversationFilePath(): string | null {
+    return this.conversationFile;
+  }
+
+  /**
    * Deletes a session file by session ID.
    */
   deleteSession(sessionId: string): void {
@@ -439,7 +488,7 @@ export class ChatRecordingService {
       const sessionPath = path.join(chatsDir, `${sessionId}.json`);
       fs.unlinkSync(sessionPath);
     } catch (error) {
-      console.error('Error deleting session:', error);
+      debugLogger.error('Error deleting session file.', error);
       throw error;
     }
   }

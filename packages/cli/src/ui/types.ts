@@ -6,10 +6,13 @@
 
 import type {
   CompressionStatus,
+  GeminiCLIExtension,
+  MCPServerConfig,
   ThoughtSummary,
   ToolCallConfirmationDetails,
   ToolConfirmationOutcome,
   ToolResultDisplay,
+  RetrieveUserQuotaResponse,
 } from '@google/gemini-cli-core';
 import type { PartListUnion } from '@google/genai';
 import { type ReactNode } from 'react';
@@ -17,10 +20,12 @@ import { type ReactNode } from 'react';
 export type { ThoughtSummary };
 
 export enum AuthState {
-  // Attemtping to authenticate or re-authenticate
+  // Attempting to authenticate or re-authenticate
   Unauthenticated = 'unauthenticated',
   // Auth dialog is open for user to select auth method
   Updating = 'updating',
+  // Waiting for user to input API key
+  AwaitingApiKeyInput = 'awaiting_api_key_input',
   // Successfully authenticated
   Authenticated = 'authenticated',
 }
@@ -66,6 +71,7 @@ export interface IndividualToolCallDisplay {
   status: ToolCallStatus;
   confirmationDetails: ToolCallConfirmationDetails | undefined;
   renderOutputAsMarkdown?: boolean;
+  ptyId?: number;
   outputFile?: string;
 }
 
@@ -75,6 +81,11 @@ export interface CompressionProps {
   newTokenCount: number | null;
   compressionStatus: CompressionStatus | null;
 }
+
+/**
+ * For use when you want no icon.
+ */
+export const emptyIcon = '  ';
 
 export interface HistoryItemBase {
   text?: string; // Text content for user/gemini/info/error messages
@@ -98,10 +109,17 @@ export type HistoryItemGeminiContent = HistoryItemBase & {
 export type HistoryItemInfo = HistoryItemBase & {
   type: 'info';
   text: string;
+  icon?: string;
+  color?: string;
 };
 
 export type HistoryItemError = HistoryItemBase & {
   type: 'error';
+  text: string;
+};
+
+export type HistoryItemWarning = HistoryItemBase & {
+  type: 'warning';
   text: string;
 };
 
@@ -114,6 +132,7 @@ export type HistoryItemAbout = HistoryItemBase & {
   selectedAuthType: string;
   gcpProject: string;
   ideClient: string;
+  userEmail?: string;
 };
 
 export type HistoryItemHelp = HistoryItemBase & {
@@ -124,6 +143,7 @@ export type HistoryItemHelp = HistoryItemBase & {
 export type HistoryItemStats = HistoryItemBase & {
   type: 'stats';
   duration: string;
+  quotas?: RetrieveUserQuotaResponse;
 };
 
 export type HistoryItemModelStats = HistoryItemBase & {
@@ -132,6 +152,11 @@ export type HistoryItemModelStats = HistoryItemBase & {
 
 export type HistoryItemToolStats = HistoryItemBase & {
   type: 'tool_stats';
+};
+
+export type HistoryItemModel = HistoryItemBase & {
+  type: 'model';
+  model: string;
 };
 
 export type HistoryItemQuit = HistoryItemBase & {
@@ -154,6 +179,100 @@ export type HistoryItemCompression = HistoryItemBase & {
   compression: CompressionProps;
 };
 
+export type HistoryItemExtensionsList = HistoryItemBase & {
+  type: 'extensions_list';
+  extensions: GeminiCLIExtension[];
+};
+
+export interface ChatDetail {
+  name: string;
+  mtime: string;
+}
+
+export type HistoryItemChatList = HistoryItemBase & {
+  type: 'chat_list';
+  chats: ChatDetail[];
+};
+
+export interface ToolDefinition {
+  name: string;
+  displayName: string;
+  description?: string;
+}
+
+export type HistoryItemToolsList = HistoryItemBase & {
+  type: 'tools_list';
+  tools: ToolDefinition[];
+  showDescriptions: boolean;
+};
+
+export interface SkillDefinition {
+  name: string;
+  description: string;
+  disabled?: boolean;
+}
+
+export type HistoryItemSkillsList = HistoryItemBase & {
+  type: 'skills_list';
+  skills: SkillDefinition[];
+  showDescriptions: boolean;
+};
+
+// JSON-friendly types for using as a simple data model showing info about an
+// MCP Server.
+export interface JsonMcpTool {
+  serverName: string;
+  name: string;
+  description?: string;
+  schema?: {
+    parametersJsonSchema?: unknown;
+    parameters?: unknown;
+  };
+}
+
+export interface JsonMcpPrompt {
+  serverName: string;
+  name: string;
+  description?: string;
+}
+
+export interface JsonMcpResource {
+  serverName: string;
+  name?: string;
+  uri?: string;
+  mimeType?: string;
+  description?: string;
+}
+
+export type HistoryItemMcpStatus = HistoryItemBase & {
+  type: 'mcp_status';
+  servers: Record<string, MCPServerConfig>;
+  tools: JsonMcpTool[];
+  prompts: JsonMcpPrompt[];
+  resources: JsonMcpResource[];
+  authStatus: Record<
+    string,
+    'authenticated' | 'expired' | 'unauthenticated' | 'not-configured'
+  >;
+  blockedServers: Array<{ name: string; extensionName: string }>;
+  discoveryInProgress: boolean;
+  connectingServers: string[];
+  showDescriptions: boolean;
+  showSchema: boolean;
+};
+
+export type HistoryItemHooksList = HistoryItemBase & {
+  type: 'hooks_list';
+  hooks: Array<{
+    config: { command?: string; type: string; timeout?: number };
+    source: string;
+    eventName: string;
+    matcher?: string;
+    sequential?: boolean;
+    enabled: boolean;
+  }>;
+};
+
 // Using Omit<HistoryItem, 'id'> seems to have some issues with typescript's
 // type inference e.g. historyItem.type === 'tool_group' isn't auto-inferring that
 // 'tools' in historyItem.
@@ -165,14 +284,22 @@ export type HistoryItemWithoutId =
   | HistoryItemGeminiContent
   | HistoryItemInfo
   | HistoryItemError
+  | HistoryItemWarning
   | HistoryItemAbout
   | HistoryItemHelp
   | HistoryItemToolGroup
   | HistoryItemStats
   | HistoryItemModelStats
   | HistoryItemToolStats
+  | HistoryItemModel
   | HistoryItemQuit
-  | HistoryItemCompression;
+  | HistoryItemCompression
+  | HistoryItemExtensionsList
+  | HistoryItemToolsList
+  | HistoryItemSkillsList
+  | HistoryItemMcpStatus
+  | HistoryItemChatList
+  | HistoryItemHooksList;
 
 export type HistoryItem = HistoryItemWithoutId & { id: number };
 
@@ -180,6 +307,7 @@ export type HistoryItem = HistoryItemWithoutId & { id: number };
 export enum MessageType {
   INFO = 'info',
   ERROR = 'error',
+  WARNING = 'warning',
   USER = 'user',
   ABOUT = 'about',
   HELP = 'help',
@@ -189,6 +317,12 @@ export enum MessageType {
   QUIT = 'quit',
   GEMINI = 'gemini',
   COMPRESSION = 'compression',
+  EXTENSIONS_LIST = 'extensions_list',
+  TOOLS_LIST = 'tools_list',
+  SKILLS_LIST = 'skills_list',
+  MCP_STATUS = 'mcp_status',
+  CHAT_LIST = 'chat_list',
+  HOOKS_LIST = 'hooks_list',
 }
 
 // Simplified message structure for internal feedback
@@ -208,6 +342,7 @@ export type Message =
       selectedAuthType: string;
       gcpProject: string;
       ideClient: string;
+      userEmail?: string;
       content?: string; // Optional content, not really used for ABOUT
     }
   | {

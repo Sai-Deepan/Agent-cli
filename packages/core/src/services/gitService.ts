@@ -7,10 +7,11 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { isNodeError } from '../utils/errors.js';
-import { exec } from 'node:child_process';
+import { spawnAsync } from '../utils/shell-utils.js';
 import type { SimpleGit } from 'simple-git';
 import { simpleGit, CheckRepoActions } from 'simple-git';
 import type { Storage } from '../config/storage.js';
+import { debugLogger } from '../utils/debugLogger.js';
 
 export class GitService {
   private projectRoot: string;
@@ -41,16 +42,13 @@ export class GitService {
     }
   }
 
-  verifyGitAvailability(): Promise<boolean> {
-    return new Promise((resolve) => {
-      exec('git --version', (error) => {
-        if (error) {
-          resolve(false);
-        } else {
-          resolve(true);
-        }
-      });
-    });
+  async verifyGitAvailability(): Promise<boolean> {
+    try {
+      await spawnAsync('git', ['--version']);
+      return true;
+    } catch (_error) {
+      return false;
+    }
   }
 
   /**
@@ -70,7 +68,16 @@ export class GitService {
     await fs.writeFile(gitConfigPath, gitConfigContent);
 
     const repo = simpleGit(repoDir);
-    const isRepoDefined = await repo.checkIsRepo(CheckRepoActions.IS_REPO_ROOT);
+    let isRepoDefined = false;
+    try {
+      isRepoDefined = await repo.checkIsRepo(CheckRepoActions.IS_REPO_ROOT);
+    } catch (error) {
+      // If checkIsRepo fails (e.g., on certain Git versions like macOS 2.39.5),
+      // log the error and assume repo is not defined, then proceed with initialization
+      debugLogger.debug(
+        `checkIsRepo failed, will initialize repository: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
 
     if (!isRepoDefined) {
       await repo.init(false, {
@@ -115,7 +122,14 @@ export class GitService {
     try {
       const repo = this.shadowGitRepository;
       await repo.add('.');
-      const commitResult = await repo.commit(message);
+      const status = await repo.status();
+      if (status.isClean()) {
+        // If no changes are staged, return the current HEAD commit hash
+        return await this.getCurrentCommitHash();
+      }
+      const commitResult = await repo.commit(message, {
+        '--no-verify': null,
+      });
       return commitResult.commit;
     } catch (error) {
       throw new Error(

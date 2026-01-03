@@ -20,12 +20,7 @@ import { getIdeProcessInfo } from './process-utils.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import {
-  detectIde,
-  DetectedIde,
-  getIdeInfo,
-  type IdeInfo,
-} from './detect-ide.js';
+import { detectIde, IDE_DEFINITIONS } from './detect-ide.js';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
@@ -64,13 +59,11 @@ describe('IdeClient', () => {
     delete process.env['GEMINI_CLI_IDE_SERVER_PORT'];
     delete process.env['GEMINI_CLI_IDE_SERVER_STDIO_COMMAND'];
     delete process.env['GEMINI_CLI_IDE_SERVER_STDIO_ARGS'];
+    delete process.env['GEMINI_CLI_IDE_AUTH_TOKEN'];
 
     // Mock dependencies
     vi.spyOn(process, 'cwd').mockReturnValue('/test/workspace/sub-dir');
-    vi.mocked(detectIde).mockReturnValue(DetectedIde.VSCode);
-    vi.mocked(getIdeInfo).mockReturnValue({
-      displayName: 'VS Code',
-    } as IdeInfo);
+    vi.mocked(detectIde).mockReturnValue(IDE_DEFINITIONS.vscode);
     vi.mocked(getIdeProcessInfo).mockResolvedValue({
       pid: 12345,
       command: 'test-ide',
@@ -83,6 +76,7 @@ describe('IdeClient', () => {
       close: vi.fn(),
       setNotificationHandler: vi.fn(),
       callTool: vi.fn(),
+      request: vi.fn(),
     } as unknown as Mocked<Client>;
     mockHttpTransport = {
       close: vi.fn(),
@@ -120,7 +114,7 @@ describe('IdeClient', () => {
         'utf8',
       );
       expect(StreamableHTTPClientTransport).toHaveBeenCalledWith(
-        new URL('http://localhost:8080/mcp'),
+        new URL('http://127.0.0.1:8080/mcp'),
         expect.any(Object),
       );
       expect(mockClient.connect).toHaveBeenCalledWith(mockHttpTransport);
@@ -188,7 +182,7 @@ describe('IdeClient', () => {
       await ideClient.connect();
 
       expect(StreamableHTTPClientTransport).toHaveBeenCalledWith(
-        new URL('http://localhost:9090/mcp'),
+        new URL('http://127.0.0.1:9090/mcp'),
         expect.any(Object),
       );
       expect(mockClient.connect).toHaveBeenCalledWith(mockHttpTransport);
@@ -236,7 +230,7 @@ describe('IdeClient', () => {
       await ideClient.connect();
 
       expect(StreamableHTTPClientTransport).toHaveBeenCalledWith(
-        new URL('http://localhost:8080/mcp'),
+        new URL('http://127.0.0.1:8080/mcp'),
         expect.any(Object),
       );
       expect(ideClient.getConnectionStatus().status).toBe(
@@ -330,7 +324,7 @@ describe('IdeClient', () => {
 
       expect(result).toEqual(config);
       expect(fs.promises.readFile).toHaveBeenCalledWith(
-        path.join('/tmp/.gemini/ide', 'gemini-ide-server-12345-123.json'),
+        path.join('/tmp/gemini/ide', 'gemini-ide-server-12345-123.json'),
         'utf8',
       );
     });
@@ -374,12 +368,10 @@ describe('IdeClient', () => {
       expect(result).toEqual(validConfig);
       expect(validateSpy).toHaveBeenCalledWith(
         '/invalid/workspace',
-        'VS Code',
         '/test/workspace/sub-dir',
       );
       expect(validateSpy).toHaveBeenCalledWith(
         '/test/workspace',
-        'VS Code',
         '/test/workspace/sub-dir',
       );
     });
@@ -525,12 +517,441 @@ describe('IdeClient', () => {
 
       expect(result).toEqual(validConfig);
       expect(fs.promises.readFile).toHaveBeenCalledWith(
-        path.join('/tmp/.gemini/ide', 'gemini-ide-server-12345-111.json'),
+        path.join('/tmp/gemini/ide', 'gemini-ide-server-12345-111.json'),
         'utf8',
       );
       expect(fs.promises.readFile).not.toHaveBeenCalledWith(
-        path.join('/tmp/.gemini/ide', 'not-a-config-file.txt'),
+        path.join('/tmp/gemini/ide', 'not-a-config-file.txt'),
         'utf8',
+      );
+    });
+
+    it('should match env port string to a number port in the config', async () => {
+      process.env['GEMINI_CLI_IDE_SERVER_PORT'] = '3333';
+      const config1 = { port: 1111, workspacePath: '/test/workspace' };
+      const config2 = { port: 3333, workspacePath: '/test/workspace2' };
+      vi.mocked(fs.promises.readFile).mockRejectedValueOnce(
+        new Error('not found'),
+      );
+      (
+        vi.mocked(fs.promises.readdir) as Mock<
+          (path: fs.PathLike) => Promise<string[]>
+        >
+      ).mockResolvedValue([
+        'gemini-ide-server-12345-111.json',
+        'gemini-ide-server-12345-222.json',
+      ]);
+      vi.mocked(fs.promises.readFile)
+        .mockResolvedValueOnce(JSON.stringify(config1))
+        .mockResolvedValueOnce(JSON.stringify(config2));
+      vi.spyOn(IdeClient, 'validateWorkspacePath').mockReturnValue({
+        isValid: true,
+      });
+
+      const ideClient = await IdeClient.getInstance();
+      const result = await (
+        ideClient as unknown as {
+          getConnectionConfigFromFile: () => Promise<unknown>;
+        }
+      ).getConnectionConfigFromFile();
+
+      expect(result).toEqual(config2);
+    });
+  });
+
+  describe('isDiffingEnabled', () => {
+    it('should return false if not connected', async () => {
+      const ideClient = await IdeClient.getInstance();
+      expect(ideClient.isDiffingEnabled()).toBe(false);
+    });
+
+    it('should return false if tool discovery fails', async () => {
+      const config = { port: '8080' };
+      vi.mocked(fs.promises.readFile).mockResolvedValue(JSON.stringify(config));
+      (
+        vi.mocked(fs.promises.readdir) as Mock<
+          (path: fs.PathLike) => Promise<string[]>
+        >
+      ).mockResolvedValue([]);
+      mockClient.request.mockRejectedValue(new Error('Method not found'));
+
+      const ideClient = await IdeClient.getInstance();
+      await ideClient.connect();
+
+      expect(ideClient.getConnectionStatus().status).toBe(
+        IDEConnectionStatus.Connected,
+      );
+      expect(ideClient.isDiffingEnabled()).toBe(false);
+    });
+
+    it('should return false if diffing tools are not available', async () => {
+      const config = { port: '8080' };
+      vi.mocked(fs.promises.readFile).mockResolvedValue(JSON.stringify(config));
+      (
+        vi.mocked(fs.promises.readdir) as Mock<
+          (path: fs.PathLike) => Promise<string[]>
+        >
+      ).mockResolvedValue([]);
+      mockClient.request.mockResolvedValue({
+        tools: [{ name: 'someOtherTool' }],
+      });
+
+      const ideClient = await IdeClient.getInstance();
+      await ideClient.connect();
+
+      expect(ideClient.getConnectionStatus().status).toBe(
+        IDEConnectionStatus.Connected,
+      );
+      expect(ideClient.isDiffingEnabled()).toBe(false);
+    });
+
+    it('should return false if only openDiff tool is available', async () => {
+      const config = { port: '8080' };
+      vi.mocked(fs.promises.readFile).mockResolvedValue(JSON.stringify(config));
+      (
+        vi.mocked(fs.promises.readdir) as Mock<
+          (path: fs.PathLike) => Promise<string[]>
+        >
+      ).mockResolvedValue([]);
+      mockClient.request.mockResolvedValue({
+        tools: [{ name: 'openDiff' }],
+      });
+
+      const ideClient = await IdeClient.getInstance();
+      await ideClient.connect();
+
+      expect(ideClient.getConnectionStatus().status).toBe(
+        IDEConnectionStatus.Connected,
+      );
+      expect(ideClient.isDiffingEnabled()).toBe(false);
+    });
+
+    it('should return true if connected and diffing tools are available', async () => {
+      const config = { port: '8080' };
+      vi.mocked(fs.promises.readFile).mockResolvedValue(JSON.stringify(config));
+      (
+        vi.mocked(fs.promises.readdir) as Mock<
+          (path: fs.PathLike) => Promise<string[]>
+        >
+      ).mockResolvedValue([]);
+      mockClient.request.mockResolvedValue({
+        tools: [{ name: 'openDiff' }, { name: 'closeDiff' }],
+      });
+
+      const ideClient = await IdeClient.getInstance();
+      await ideClient.connect();
+
+      expect(ideClient.getConnectionStatus().status).toBe(
+        IDEConnectionStatus.Connected,
+      );
+      expect(ideClient.isDiffingEnabled()).toBe(true);
+    });
+  });
+
+  describe('resolveDiffFromCli', () => {
+    beforeEach(async () => {
+      // Ensure client is "connected" for these tests
+      const ideClient = await IdeClient.getInstance();
+      // We need to set the client property on the instance for openDiff to work
+      (ideClient as unknown as { client: Client }).client = mockClient;
+      mockClient.request.mockResolvedValue({
+        isError: false,
+        content: [],
+      });
+    });
+
+    it("should resolve an open diff as 'accepted' and return the final content", async () => {
+      const ideClient = await IdeClient.getInstance();
+      const closeDiffSpy = vi
+        .spyOn(
+          ideClient as unknown as {
+            closeDiff: () => Promise<string | undefined>;
+          },
+          'closeDiff',
+        )
+        .mockResolvedValue('final content from ide');
+
+      const diffPromise = ideClient.openDiff('/test.txt', 'new content');
+
+      // Yield to the event loop to allow the openDiff promise executor to run
+      await new Promise((resolve) => setImmediate(resolve));
+
+      await ideClient.resolveDiffFromCli('/test.txt', 'accepted');
+
+      const result = await diffPromise;
+
+      expect(result).toEqual({
+        status: 'accepted',
+        content: 'final content from ide',
+      });
+      expect(closeDiffSpy).toHaveBeenCalledWith('/test.txt', {
+        suppressNotification: true,
+      });
+      expect(
+        (
+          ideClient as unknown as { diffResponses: Map<string, unknown> }
+        ).diffResponses.has('/test.txt'),
+      ).toBe(false);
+    });
+
+    it("should resolve an open diff as 'rejected'", async () => {
+      const ideClient = await IdeClient.getInstance();
+      const closeDiffSpy = vi
+        .spyOn(
+          ideClient as unknown as {
+            closeDiff: () => Promise<string | undefined>;
+          },
+          'closeDiff',
+        )
+        .mockResolvedValue(undefined);
+
+      const diffPromise = ideClient.openDiff('/test.txt', 'new content');
+
+      // Yield to the event loop to allow the openDiff promise executor to run
+      await new Promise((resolve) => setImmediate(resolve));
+
+      await ideClient.resolveDiffFromCli('/test.txt', 'rejected');
+
+      const result = await diffPromise;
+
+      expect(result).toEqual({
+        status: 'rejected',
+        content: undefined,
+      });
+      expect(closeDiffSpy).toHaveBeenCalledWith('/test.txt', {
+        suppressNotification: true,
+      });
+      expect(
+        (
+          ideClient as unknown as { diffResponses: Map<string, unknown> }
+        ).diffResponses.has('/test.txt'),
+      ).toBe(false);
+    });
+
+    it('should do nothing if no diff is open for the given file path', async () => {
+      const ideClient = await IdeClient.getInstance();
+      const closeDiffSpy = vi
+        .spyOn(
+          ideClient as unknown as {
+            closeDiff: () => Promise<string | undefined>;
+          },
+          'closeDiff',
+        )
+        .mockResolvedValue(undefined);
+
+      // No call to openDiff, so no resolver will exist.
+      await ideClient.resolveDiffFromCli('/non-existent.txt', 'accepted');
+
+      expect(closeDiffSpy).toHaveBeenCalledWith('/non-existent.txt', {
+        suppressNotification: true,
+      });
+      // No crash should occur, and nothing should be in the map.
+      expect(
+        (
+          ideClient as unknown as { diffResponses: Map<string, unknown> }
+        ).diffResponses.has('/non-existent.txt'),
+      ).toBe(false);
+    });
+  });
+
+  describe('closeDiff', () => {
+    beforeEach(async () => {
+      const ideClient = await IdeClient.getInstance();
+      (ideClient as unknown as { client: Client }).client = mockClient;
+    });
+
+    it('should return undefined if client is not connected', async () => {
+      const ideClient = await IdeClient.getInstance();
+      (ideClient as unknown as { client: Client | undefined }).client =
+        undefined;
+
+      const result = await (
+        ideClient as unknown as { closeDiff: (f: string) => Promise<void> }
+      ).closeDiff('/test.txt');
+      expect(result).toBeUndefined();
+    });
+
+    it('should call client.request with correct arguments', async () => {
+      const ideClient = await IdeClient.getInstance();
+      // Return a valid, empty response as the return value is not under test here.
+      mockClient.request.mockResolvedValue({ isError: false, content: [] });
+
+      await (
+        ideClient as unknown as {
+          closeDiff: (
+            f: string,
+            o?: { suppressNotification?: boolean },
+          ) => Promise<void>;
+        }
+      ).closeDiff('/test.txt', { suppressNotification: true });
+
+      expect(mockClient.request).toHaveBeenCalledWith(
+        expect.objectContaining({
+          params: {
+            name: 'closeDiff',
+            arguments: {
+              filePath: '/test.txt',
+              suppressNotification: true,
+            },
+          },
+        }),
+        expect.any(Object), // Schema
+        expect.any(Object), // Options
+      );
+    });
+
+    it('should return content from a valid JSON response', async () => {
+      const ideClient = await IdeClient.getInstance();
+      const response = {
+        isError: false,
+        content: [
+          { type: 'text', text: JSON.stringify({ content: 'file content' }) },
+        ],
+      };
+      mockClient.request.mockResolvedValue(response);
+
+      const result = await (
+        ideClient as unknown as { closeDiff: (f: string) => Promise<string> }
+      ).closeDiff('/test.txt');
+      expect(result).toBe('file content');
+    });
+
+    it('should return undefined for a valid JSON response with null content', async () => {
+      const ideClient = await IdeClient.getInstance();
+      const response = {
+        isError: false,
+        content: [{ type: 'text', text: JSON.stringify({ content: null }) }],
+      };
+      mockClient.request.mockResolvedValue(response);
+
+      const result = await (
+        ideClient as unknown as { closeDiff: (f: string) => Promise<void> }
+      ).closeDiff('/test.txt');
+      expect(result).toBeUndefined();
+    });
+
+    it('should return undefined if response is not valid JSON', async () => {
+      const ideClient = await IdeClient.getInstance();
+      const response = {
+        isError: false,
+        content: [{ type: 'text', text: 'not json' }],
+      };
+      mockClient.request.mockResolvedValue(response);
+
+      const result = await (
+        ideClient as unknown as { closeDiff: (f: string) => Promise<void> }
+      ).closeDiff('/test.txt');
+      expect(result).toBeUndefined();
+    });
+
+    it('should return undefined if request result has isError: true', async () => {
+      const ideClient = await IdeClient.getInstance();
+      const response = {
+        isError: true,
+        content: [{ type: 'text', text: 'An error occurred' }],
+      };
+      mockClient.request.mockResolvedValue(response);
+
+      const result = await (
+        ideClient as unknown as { closeDiff: (f: string) => Promise<void> }
+      ).closeDiff('/test.txt');
+      expect(result).toBeUndefined();
+    });
+
+    it('should return undefined if client.request throws', async () => {
+      const ideClient = await IdeClient.getInstance();
+      mockClient.request.mockRejectedValue(new Error('Request failed'));
+
+      const result = await (
+        ideClient as unknown as { closeDiff: (f: string) => Promise<void> }
+      ).closeDiff('/test.txt');
+      expect(result).toBeUndefined();
+    });
+
+    it('should return undefined if response has no text part', async () => {
+      const ideClient = await IdeClient.getInstance();
+      const response = {
+        isError: false,
+        content: [{ type: 'other' }],
+      };
+      mockClient.request.mockResolvedValue(response);
+
+      const result = await (
+        ideClient as unknown as { closeDiff: (f: string) => Promise<void> }
+      ).closeDiff('/test.txt');
+      expect(result).toBeUndefined();
+    });
+
+    it('should return undefined if response is falsy', async () => {
+      const ideClient = await IdeClient.getInstance();
+      // Mocking with `null as any` to test the falsy path, as the mock
+      // function is strictly typed.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      mockClient.request.mockResolvedValue(null as any);
+
+      const result = await (
+        ideClient as unknown as { closeDiff: (f: string) => Promise<void> }
+      ).closeDiff('/test.txt');
+      expect(result).toBeUndefined();
+    });
+  });
+
+  describe('authentication', () => {
+    it('should connect with an auth token if provided in the discovery file', async () => {
+      const authToken = 'test-auth-token';
+      const config = { port: '8080', authToken };
+      vi.mocked(fs.promises.readFile).mockResolvedValue(JSON.stringify(config));
+      (
+        vi.mocked(fs.promises.readdir) as Mock<
+          (path: fs.PathLike) => Promise<string[]>
+        >
+      ).mockResolvedValue([]);
+
+      const ideClient = await IdeClient.getInstance();
+      await ideClient.connect();
+
+      expect(StreamableHTTPClientTransport).toHaveBeenCalledWith(
+        new URL('http://127.0.0.1:8080/mcp'),
+        expect.objectContaining({
+          requestInit: {
+            headers: {
+              Authorization: `Bearer ${authToken}`,
+            },
+          },
+        }),
+      );
+      expect(ideClient.getConnectionStatus().status).toBe(
+        IDEConnectionStatus.Connected,
+      );
+    });
+
+    it('should connect with an auth token from environment variable if config file is missing', async () => {
+      vi.mocked(fs.promises.readFile).mockRejectedValue(
+        new Error('File not found'),
+      );
+      (
+        vi.mocked(fs.promises.readdir) as Mock<
+          (path: fs.PathLike) => Promise<string[]>
+        >
+      ).mockResolvedValue([]);
+      process.env['GEMINI_CLI_IDE_SERVER_PORT'] = '9090';
+      process.env['GEMINI_CLI_IDE_AUTH_TOKEN'] = 'env-auth-token';
+
+      const ideClient = await IdeClient.getInstance();
+      await ideClient.connect();
+
+      expect(StreamableHTTPClientTransport).toHaveBeenCalledWith(
+        new URL('http://127.0.0.1:9090/mcp'),
+        expect.objectContaining({
+          requestInit: {
+            headers: {
+              Authorization: 'Bearer env-auth-token',
+            },
+          },
+        }),
+      );
+      expect(ideClient.getConnectionStatus().status).toBe(
+        IDEConnectionStatus.Connected,
       );
     });
   });

@@ -20,12 +20,11 @@ import type {
   Status as CoreStatus,
   EditorType,
 } from '@google/gemini-cli-core';
-import { CoreToolScheduler } from '@google/gemini-cli-core';
-import { useCallback, useState, useMemo } from 'react';
+import { CoreToolScheduler, debugLogger } from '@google/gemini-cli-core';
+import { useCallback, useState, useMemo, useEffect, useRef } from 'react';
 import type {
   HistoryItemToolGroup,
   IndividualToolCallDisplay,
-  HistoryItemWithoutId,
 } from '../types.js';
 import { ToolCallStatus } from '../types.js';
 
@@ -46,6 +45,7 @@ export type TrackedWaitingToolCall = WaitingToolCall & {
 };
 export type TrackedExecutingToolCall = ExecutingToolCall & {
   responseSubmittedToGemini?: boolean;
+  pid?: number;
 };
 export type TrackedCompletedToolCall = CompletedToolCall & {
   responseSubmittedToGemini?: boolean;
@@ -62,73 +62,98 @@ export type TrackedToolCall =
   | TrackedCompletedToolCall
   | TrackedCancelledToolCall;
 
+export type CancelAllFn = (signal: AbortSignal) => void;
+
 export function useReactToolScheduler(
   onComplete: (tools: CompletedToolCall[]) => Promise<void>,
   config: Config,
-  setPendingHistoryItem: React.Dispatch<
-    React.SetStateAction<HistoryItemWithoutId | null>
-  >,
   getPreferredEditor: () => EditorType | undefined,
-  onEditorClose: () => void,
-): [TrackedToolCall[], ScheduleFn, MarkToolsAsSubmittedFn] {
+): [
+  TrackedToolCall[],
+  ScheduleFn,
+  MarkToolsAsSubmittedFn,
+  React.Dispatch<React.SetStateAction<TrackedToolCall[]>>,
+  CancelAllFn,
+  number,
+] {
   const [toolCallsForDisplay, setToolCallsForDisplay] = useState<
     TrackedToolCall[]
   >([]);
+  const [lastToolOutputTime, setLastToolOutputTime] = useState<number>(0);
+
+  // Store callbacks in refs to keep them up-to-date without causing re-renders.
+  const onCompleteRef = useRef(onComplete);
+  const getPreferredEditorRef = useRef(getPreferredEditor);
+
+  useEffect(() => {
+    onCompleteRef.current = onComplete;
+  }, [onComplete]);
+
+  useEffect(() => {
+    getPreferredEditorRef.current = getPreferredEditor;
+  }, [getPreferredEditor]);
 
   const outputUpdateHandler: OutputUpdateHandler = useCallback(
     (toolCallId, outputChunk) => {
-      setPendingHistoryItem((prevItem) => {
-        if (prevItem?.type === 'tool_group') {
-          return {
-            ...prevItem,
-            tools: prevItem.tools.map((toolDisplay) =>
-              toolDisplay.callId === toolCallId &&
-              toolDisplay.status === ToolCallStatus.Executing
-                ? { ...toolDisplay, resultDisplay: outputChunk }
-                : toolDisplay,
-            ),
-          };
-        }
-        return prevItem;
-      });
-
+      setLastToolOutputTime(Date.now());
       setToolCallsForDisplay((prevCalls) =>
         prevCalls.map((tc) => {
           if (tc.request.callId === toolCallId && tc.status === 'executing') {
-            const executingTc = tc as TrackedExecutingToolCall;
+            const executingTc = tc;
             return { ...executingTc, liveOutput: outputChunk };
           }
           return tc;
         }),
       );
     },
-    [setPendingHistoryItem],
+    [],
   );
 
   const allToolCallsCompleteHandler: AllToolCallsCompleteHandler = useCallback(
     async (completedToolCalls) => {
-      await onComplete(completedToolCalls);
+      await onCompleteRef.current(completedToolCalls);
     },
-    [onComplete],
+    [],
   );
 
   const toolCallsUpdateHandler: ToolCallsUpdateHandler = useCallback(
-    (updatedCoreToolCalls: ToolCall[]) => {
-      setToolCallsForDisplay((prevTrackedCalls) =>
-        updatedCoreToolCalls.map((coreTc) => {
-          const existingTrackedCall = prevTrackedCalls.find(
-            (ptc) => ptc.request.callId === coreTc.request.callId,
-          );
-          const newTrackedCall: TrackedToolCall = {
-            ...coreTc,
-            responseSubmittedToGemini:
-              existingTrackedCall?.responseSubmittedToGemini ?? false,
-          } as TrackedToolCall;
-          return newTrackedCall;
-        }),
-      );
+    (allCoreToolCalls: ToolCall[]) => {
+      setToolCallsForDisplay((prevTrackedCalls) => {
+        const prevCallsMap = new Map(
+          prevTrackedCalls.map((c) => [c.request.callId, c]),
+        );
+
+        return allCoreToolCalls.map((coreTc): TrackedToolCall => {
+          const existingTrackedCall = prevCallsMap.get(coreTc.request.callId);
+
+          const responseSubmittedToGemini =
+            existingTrackedCall?.responseSubmittedToGemini ?? false;
+
+          if (coreTc.status === 'executing') {
+            // Preserve live output if it exists from a previous render.
+            const liveOutput = (existingTrackedCall as TrackedExecutingToolCall)
+              ?.liveOutput;
+            return {
+              ...coreTc,
+              responseSubmittedToGemini,
+              liveOutput,
+              pid: coreTc.pid,
+            };
+          } else {
+            return {
+              ...coreTc,
+              responseSubmittedToGemini,
+            };
+          }
+        });
+      });
     },
     [setToolCallsForDisplay],
+  );
+
+  const stableGetPreferredEditor = useCallback(
+    () => getPreferredEditorRef.current(),
+    [],
   );
 
   const scheduler = useMemo(
@@ -137,18 +162,15 @@ export function useReactToolScheduler(
         outputUpdateHandler,
         onAllToolCallsComplete: allToolCallsCompleteHandler,
         onToolCallsUpdate: toolCallsUpdateHandler,
-        getPreferredEditor,
+        getPreferredEditor: stableGetPreferredEditor,
         config,
-        onEditorClose,
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      } as any),
+      }),
     [
       config,
       outputUpdateHandler,
       allToolCallsCompleteHandler,
       toolCallsUpdateHandler,
-      getPreferredEditor,
-      onEditorClose,
+      stableGetPreferredEditor,
     ],
   );
 
@@ -157,9 +179,10 @@ export function useReactToolScheduler(
       request: ToolCallRequestInfo | ToolCallRequestInfo[],
       signal: AbortSignal,
     ) => {
+      setToolCallsForDisplay([]);
       void scheduler.schedule(request, signal);
     },
-    [scheduler],
+    [scheduler, setToolCallsForDisplay],
   );
 
   const markToolsAsSubmitted: MarkToolsAsSubmittedFn = useCallback(
@@ -175,7 +198,21 @@ export function useReactToolScheduler(
     [],
   );
 
-  return [toolCallsForDisplay, schedule, markToolsAsSubmitted];
+  const cancelAllToolCalls = useCallback(
+    (signal: AbortSignal) => {
+      scheduler.cancelAll(signal);
+    },
+    [scheduler],
+  );
+
+  return [
+    toolCallsForDisplay,
+    schedule,
+    markToolsAsSubmitted,
+    setToolCallsForDisplay,
+    cancelAllToolCalls,
+    lastToolOutputTime,
+  ];
 }
 
 /**
@@ -199,7 +236,7 @@ function mapCoreStatusToDisplayStatus(coreStatus: CoreStatus): ToolCallStatus {
       return ToolCallStatus.Pending;
     default: {
       const exhaustiveCheck: never = coreStatus;
-      console.warn(`Unknown core status encountered: ${exhaustiveCheck}`);
+      debugLogger.warn(`Unknown core status encountered: ${exhaustiveCheck}`);
       return ToolCallStatus.Error;
     }
   }
@@ -275,9 +312,9 @@ export function mapToDisplay(
           return {
             ...baseDisplayProperties,
             status: mapCoreStatusToDisplayStatus(trackedCall.status),
-            resultDisplay:
-              (trackedCall as TrackedExecutingToolCall).liveOutput ?? undefined,
+            resultDisplay: trackedCall.liveOutput ?? undefined,
             confirmationDetails: undefined,
+            ptyId: trackedCall.pid,
           };
         case 'validating': // Fallthrough
         case 'scheduled':
